@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    Konvertiertes BlackViper Windows 7 Skript fuer Windows 10 + Win10 Optimierungen.
+    Konvertiertes BlackViper Windows 7 Skript fuer Windows 10/11 + Optimierungen.
     
 .DESCRIPTION
     Dieses Skript konfiguriert Windows-Dienste basierend auf der BlackViper "Tweaked" Liste.
-    Es enthaelt zusaetzliche Bereinigungen fuer Windows 10 (Telemetrie, Xbox, Maps).
+    Es enthaelt zusaetzliche Bereinigungen fuer Windows 10/11 (Telemetrie, Xbox, Maps).
     
     ACHTUNG: Aenderungen an Diensten koennen die Systemfunktionalitaet beeintraechtigen.
     Erstellen Sie vor der Ausfuehrung einen Wiederherstellungspunkt!
@@ -16,6 +16,44 @@
     4 = Deaktiviert
 #>
 
+# Erfordert Administratorrechte
+$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal($CurrentIdentity)
+if (-not $CurrentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "[FEHLER] Dieses Skript muss als Administrator ausgefuehrt werden." -ForegroundColor Red
+    Write-Host "Bitte PowerShell als Administrator starten und erneut ausfuehren." -ForegroundColor Yellow
+    exit 1
+}
+
+# OS-Info ermitteln (Win11 ab Build 22000)
+$OsInfo = Get-CimInstance -ClassName Win32_OperatingSystem
+$BuildNumber = [int]$OsInfo.BuildNumber
+$IsWindows11 = $BuildNumber -ge 22000
+
+function Resolve-ServiceRegistryPaths {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName
+    )
+
+    $basePath = "HKLM:\SYSTEM\CurrentControlSet\Services"
+    $exactPath = Join-Path -Path $basePath -ChildPath $ServiceName
+
+    if (Test-Path $exactPath) {
+        return @($exactPath)
+    }
+
+    $instancePaths = Get-ChildItem -Path $basePath -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -like "$ServiceName_*" } |
+        Select-Object -ExpandProperty PSPath
+
+    if ($instancePaths) {
+        return $instancePaths
+    }
+
+    return @()
+}
+
 # Funktion zur Konfiguration der Dienste
 function Set-ServiceConfiguration {
     param (
@@ -24,36 +62,106 @@ function Set-ServiceConfiguration {
         [bool]$DelayedStart = $false
     )
 
-    $RegistryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    if ($StartType -notin 2, 3, 4) {
+        Write-Host "[FEHLER] Ungueltiger StartType fuer ${ServiceName}: $StartType" -ForegroundColor Red
+        return
+    }
 
-    if (Test-Path $RegistryPath) {
-        try {
-            # Start-Typ setzen
-            Set-ItemProperty -Path $RegistryPath -Name "Start" -Value $StartType -ErrorAction Stop
-            
-            # DelayedAutoStart handhaben (Nur relevant wenn Start=2)
-            if ($StartType -eq 2 -and $DelayedStart) {
-                Set-ItemProperty -Path $RegistryPath -Name "DelayedAutoStart" -Value 1 -ErrorAction Stop
-            } elseif (Get-ItemProperty -Path $RegistryPath -Name "DelayedAutoStart" -ErrorAction SilentlyContinue) {
-                Set-ItemProperty -Path $RegistryPath -Name "DelayedAutoStart" -Value 0 -ErrorAction SilentlyContinue
+    $registryPaths = Resolve-ServiceRegistryPaths -ServiceName $ServiceName
+
+    if ($registryPaths.Count -gt 0) {
+        foreach ($RegistryPath in $registryPaths) {
+            try {
+                # Start-Typ setzen
+                Set-ItemProperty -Path $RegistryPath -Name "Start" -Value $StartType -ErrorAction Stop
+
+                # DelayedAutoStart handhaben (Nur relevant wenn Start=2)
+                if ($StartType -eq 2 -and $DelayedStart) {
+                    Set-ItemProperty -Path $RegistryPath -Name "DelayedAutoStart" -Value 1 -ErrorAction SilentlyContinue
+                }
+                elseif (Get-ItemProperty -Path $RegistryPath -Name "DelayedAutoStart" -ErrorAction SilentlyContinue) {
+                    Set-ItemProperty -Path $RegistryPath -Name "DelayedAutoStart" -Value 0 -ErrorAction SilentlyContinue
+                }
+
+                $resolvedServiceName = Split-Path -Path $RegistryPath -Leaf
+
+                $modeStr = switch ($StartType) { 2 { "Automatisch" } 3 { "Manuell" } 4 { "Deaktiviert" } default { "Unbekannt" } }
+                if ($DelayedStart -and $StartType -eq 2) { $modeStr += " (Verzoegert)" }
+
+                Write-Host "[OK] $resolvedServiceName gesetzt auf: $modeStr" -ForegroundColor Green
             }
-
-            $modeStr = switch ($StartType) { 2 { "Automatisch" } 3 { "Manuell" } 4 { "Deaktiviert" } default { "Unbekannt" } }
-            if ($DelayedStart) { $modeStr += " (Verzoegert)" }
-            
-            Write-Host "[OK] $ServiceName gesetzt auf: $modeStr" -ForegroundColor Green
-
-        } catch {
-            Write-Host "[FEHLER] Konnte $ServiceName nicht konfigurieren. Grund: $($_.Exception.Message)" -ForegroundColor Red
+            catch {
+                Write-Host "[FEHLER] Konnte $ServiceName nicht konfigurieren. Grund: $($_.Exception.Message)" -ForegroundColor Red
+            }
         }
-    } else {
+    }
+    else {
         Write-Host "[INFO] Dienst $ServiceName nicht gefunden (Ignoriert)" -ForegroundColor DarkGray
     }
 }
 
-Write-Host "Starte Dienst-Optimierung..." -ForegroundColor Cyan
+Write-Host "Starte Dienst-Optimierung fuer $($OsInfo.Caption) (Build $BuildNumber)..." -ForegroundColor Cyan
 Write-Host "Druecken Sie STRG+C, um abzubrechen, oder eine beliebige Taste zum Fortfahren."
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+if ($Host.Name -eq "ConsoleHost" -and $Host.UI -and $Host.UI.RawUI) {
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}
+
+if (-not (Get-Command -Name "Set-ServiceConfiguration" -CommandType Function -ErrorAction SilentlyContinue)) {
+    Write-Host "[WARNUNG] 'Set-ServiceConfiguration' nicht gefunden. Lade kompatiblen Fallback..." -ForegroundColor Yellow
+
+    function Set-ServiceConfiguration {
+        param (
+            [string]$ServiceName,
+            [int]$StartType,
+            [bool]$DelayedStart = $false
+        )
+
+        if ($StartType -notin 2, 3, 4) {
+            Write-Host "[FEHLER] Ungueltiger StartType fuer ${ServiceName}: $StartType" -ForegroundColor Red
+            return
+        }
+
+        $registryBasePath = "HKLM:\SYSTEM\CurrentControlSet\Services"
+        $registryPaths = @()
+        $exactPath = Join-Path -Path $registryBasePath -ChildPath $ServiceName
+
+        if (Test-Path $exactPath) {
+            $registryPaths = @($exactPath)
+        }
+        else {
+            $registryPaths = Get-ChildItem -Path $registryBasePath -ErrorAction SilentlyContinue |
+                Where-Object { $_.PSChildName -like "$ServiceName_*" } |
+                Select-Object -ExpandProperty PSPath
+        }
+
+        if (-not $registryPaths -or $registryPaths.Count -eq 0) {
+            Write-Host "[INFO] Dienst $ServiceName nicht gefunden (Ignoriert)" -ForegroundColor DarkGray
+            return
+        }
+
+        foreach ($RegistryPath in $registryPaths) {
+            try {
+                Set-ItemProperty -Path $RegistryPath -Name "Start" -Value $StartType -ErrorAction Stop
+
+                if ($StartType -eq 2 -and $DelayedStart) {
+                    Set-ItemProperty -Path $RegistryPath -Name "DelayedAutoStart" -Value 1 -ErrorAction SilentlyContinue
+                }
+                elseif (Get-ItemProperty -Path $RegistryPath -Name "DelayedAutoStart" -ErrorAction SilentlyContinue) {
+                    Set-ItemProperty -Path $RegistryPath -Name "DelayedAutoStart" -Value 0 -ErrorAction SilentlyContinue
+                }
+
+                $resolvedServiceName = Split-Path -Path $RegistryPath -Leaf
+                $modeStr = switch ($StartType) { 2 { "Automatisch" } 3 { "Manuell" } 4 { "Deaktiviert" } default { "Unbekannt" } }
+                if ($DelayedStart -and $StartType -eq 2) { $modeStr += " (Verzoegert)" }
+
+                Write-Host "[OK] $resolvedServiceName gesetzt auf: $modeStr" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "[FEHLER] Konnte $ServiceName nicht konfigurieren. Grund: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+    }
+}
 
 # ---------------------------------------------------------
 # Originale BlackViper Tweaks (Portiert fuer Win10)
@@ -172,10 +280,29 @@ Set-ServiceConfiguration -ServiceName "WSearch" -StartType 2 -DelayedStart $true
 # Mixed Reality
 Set-ServiceConfiguration -ServiceName "MixedRealityOpenXRSvc" -StartType 3 # Default: 3 | Windows Mixed Reality
 
+# ---------------------------------------------------------
+# Windows 11 spezifische Optimierungen (Safe Tweaks)
+# ---------------------------------------------------------
+
+if ($IsWindows11) {
+    Write-Host "`n--- Wende Windows 11 spezifische Optimierungen an ---`n" -ForegroundColor Magenta
+
+    # User- und Feature-Dienste (auf Manuell belassen, um Ressourcen zu sparen ohne hart zu deaktivieren)
+    Set-ServiceConfiguration -ServiceName "BcastDVRUserService" -StartType 3 # GameDVR User Service
+    Set-ServiceConfiguration -ServiceName "CaptureService" -StartType 3 # Aufnahme- und Capture-Komponenten
+    Set-ServiceConfiguration -ServiceName "PrintWorkflowUserSvc" -StartType 3 # Print Workflow User Service
+
+    # Optional selten genutzte Features deaktivieren
+    Set-ServiceConfiguration -ServiceName "Fax" -StartType 4 # Fax-Dienst
+    Set-ServiceConfiguration -ServiceName "PhoneSvc" -StartType 4 # Telefoniedienst
+}
+
 Write-Host "`nFertig. Bitte System neu starten." -ForegroundColor Cyan
 
 # Warten, bis der Benutzer das Fenster schließt oder eine Taste drückt,
 # damit die Konsolenprotokolle angesehen werden können.
 Write-Host "Druecken Sie eine beliebige Taste oder schließen Sie das Fenster, um das Skript zu beenden..." -ForegroundColor Yellow
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+if ($Host.Name -eq "ConsoleHost" -and $Host.UI -and $Host.UI.RawUI) {
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}
 
